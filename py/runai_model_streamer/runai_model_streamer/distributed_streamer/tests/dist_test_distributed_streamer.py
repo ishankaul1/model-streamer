@@ -287,8 +287,14 @@ class TestDistributedStreamer(unittest.TestCase):
         # two staging slots alternate and each is refilled while the caller still holds the other's
         # tensors. Also checks the device of the background prefill thread: a new thread's current
         # device is 0, and a rank that prefilled from it created a CUDA context on GPU 0.
+        #
+        # Needs NCCL for the CUDA tensors: under plain gloo, stream_files falls back to non-distributed
+        # streaming for a CUDA device and never prefills. Run with a process group initialized as
+        # "cpu:gloo,cuda:nccl", so the test's own CPU broadcasts still go through gloo.
         if self.world_size < 2 or torch.cuda.device_count() < self.world_size:
             self.skipTest("CUDA staging test requires one GPU per process, and at least 2 processes.")
+        if "nccl" not in str(dist.get_backend()):
+            self.skipTest("CUDA staging test requires an NCCL backend for CUDA tensors.")
 
         from runai_model_streamer.distributed_streamer import distributed_streamer as ds
 
@@ -325,7 +331,7 @@ class TestDistributedStreamer(unittest.TestCase):
                 self.assertEqual(len(got), num_chunks)
                 for (req_id, idx), data in got.items():
                     self.assertEqual(data, original[req_id][idx * chunk: (idx + 1) * chunk])
-        self.assertEqual(prefill_devices, {self.rank})
+        self.assertEqual(prefill_devices, {self.rank}, "empty means the stream was not distributed")
         if self.rank == 0:
             print(f"\n✅ CUDA staging verified on all {self.world_size} ranks.")
 
