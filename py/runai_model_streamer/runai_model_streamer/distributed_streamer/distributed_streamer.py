@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import os
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 import socket
 
 from runai_model_streamer.file_streamer import (
@@ -534,17 +535,34 @@ class _distributedStreamer:
         alignment = get_dist_buffer_alignment()
 
         # Over-allocate by alignment so we can slice to the first aligned address within each buffer.
-        # This guarantees data_buffer.data_ptr() % alignment == 0 and
-        # received_buffer.data_ptr() % alignment == 0, so any offset that is a multiple of
-        # alignment is also aligned in both buffers — required for alignment to hold on receiving ranks.
-        data_buffer_raw = torch.empty(BUFFER_BYTESIZE + alignment, dtype=torch.uint8, device=self.device)
-        received_buffer_raw = torch.empty(BUFFER_BYTESIZE + alignment, dtype=torch.uint8, device=self.device)
-        data_buffer = data_buffer_raw if alignment <= 1 else data_buffer_raw[(-data_buffer_raw.data_ptr()) % alignment:]
-        received_buffer = received_buffer_raw if alignment <= 1 else received_buffer_raw[(-received_buffer_raw.data_ptr()) % alignment:]
+        # This guarantees every buffer's data_ptr() % alignment == 0, so any offset that is a multiple of
+        # alignment is also aligned in all of them — required for alignment to hold on receiving ranks.
+        def aligned_buffer() -> torch.Tensor:
+            raw = torch.empty(BUFFER_BYTESIZE + alignment, dtype=torch.uint8, device=self.device)
+            return raw if alignment <= 1 else raw[(-raw.data_ptr()) % alignment:]
 
-        batch_metadata_tensor = torch.zeros(MAX_CHUNKS_PER_BATCH + 1, 4, dtype=torch.int64, device=self.device)
+        # Two staging slots, used in alternate rounds. While one round is broadcast and handed to the
+        # caller from one slot, a background thread prefills the next round into the other. A generator
+        # only runs when the caller asks for the next item, so with one slot the host-to-device copies
+        # of round i+1 could not start until the caller had consumed all of round i.
+        #
+        # The receive side keeps one buffer. Only dist.broadcast on this thread writes it.
+        data_buffers = [aligned_buffer(), aligned_buffer()]
+        batch_metadata_tensors = [torch.zeros(MAX_CHUNKS_PER_BATCH + 1, 4, dtype=torch.int64, device=self.device) for _ in range(2)]
+        received_buffer = aligned_buffer()
         received_metadata_tensor = torch.zeros(MAX_CHUNKS_PER_BATCH + 1, 4, dtype=torch.int64, device=self.device)
-        
+
+        # Ordering on CUDA:
+        # - prefill runs on copy_stream. This thread's stream waits on the event recorded after it
+        #   (filled) before broadcasting that slot.
+        # - After a round, an event on this thread's stream marks its slot free. It follows the
+        #   broadcast and everything the caller enqueued on the yielded tensors, including the clone
+        #   under owned. copy_stream waits on it before refilling that slot two rounds later.
+        # On the CPU every copy is synchronous and the thread handoff alone orders them.
+        on_cuda = self.device.type == "cuda"
+        copy_stream = torch.cuda.Stream(device=self.device) if on_cuda else None
+        slot_free = [None, None]
+
         ready_chunks_iterator = self.file_streamer.get_chunks()
         
         def chunk_generator():
@@ -556,40 +574,63 @@ class _distributedStreamer:
         chunk_gen = chunk_generator()
         leftover_chunk = [None]
 
+        # Runs on the background thread. Only one prefill runs at a time, so chunk_gen and
+        # leftover_chunk keep a single consumer.
+        def prefill_slot(slot: int):
+            args = (chunk_gen, MAX_CHUNKS_PER_BATCH, BUFFER_BYTESIZE, data_buffers[slot], received_buffer,
+                    batch_metadata_tensors[slot], received_metadata_tensor, leftover_chunk, alignment)
+            if copy_stream is None:
+                return self.prefill(*args), None
+            # A new thread's current device is device 0. Without this, every rank creates a CUDA context
+            # on GPU 0 (about 640 MiB each), which ran GPU 0 of an 8-GPU node out of memory under load.
+            # copy_stream.device, not self.device: a bare "cuda" resolves to the CALLER's current device
+            # only on the caller's thread, where the stream was created.
+            torch.cuda.set_device(copy_stream.device)
+            with torch.cuda.stream(copy_stream):
+                if slot_free[slot] is not None:
+                    copy_stream.wait_event(slot_free[slot])
+                result = self.prefill(*args)
+                return result, copy_stream.record_event()
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="runai-dist-prefill")
+        slot = 0
+        pending = executor.submit(prefill_slot, slot)
+        prefill_wait = 0.0
+
         try:
             while chunks_to_read[0] > 0:
-                # --- Fill staging buffer ---
-                current_data_size, chunk_count_in_batch = self.prefill(
-                    chunk_gen,
-                    MAX_CHUNKS_PER_BATCH,
-                    BUFFER_BYTESIZE,
-                    data_buffer,
-                    received_buffer,
-                    batch_metadata_tensor,
-                    received_metadata_tensor,
-                    leftover_chunk,
-                    alignment)
+                # --- Take the filled slot, start filling the other ---
+                start = timer()
+                (current_data_size, chunk_count_in_batch), filled = pending.result()
+                prefill_wait += timer() - start
+                if filled is not None:
+                    torch.cuda.current_stream(self.device).wait_event(filled)
+                pending = executor.submit(prefill_slot, 1 - slot)
 
                 logger.debug(f"[RunAI Streamer][Distributed] Rank {self.original_group_rank}: Prefilled buffer with {chunk_count_in_batch} chunks and total size {humanize.naturalsize(current_data_size)}")
 
                 # --- Broadcast ---
                 #
                 # Owned here rather than at broadcast()'s two yields, so there is no second site to
-                # miss - a missed one is a tensor that looks right and is overwritten next round.
+                # miss - a missed one is a tensor that looks right and is overwritten in a later round.
                 #
-                # No event is needed, and the clone adds no ordering requirement that was not already
-                # there. data_buffer is next written by prefill()'s copy_ on this same stream;
-                # received_buffer is next written by dist.broadcast on NCCL's, which torch orders
-                # against this one - a dependency master already relies on for borrowed views.
+                # The clone is enqueued on this thread's stream before slot_free is recorded, so the
+                # refill of this slot waits for it. received_buffer is next written by dist.broadcast on
+                # NCCL's stream, which torch orders against this one - a dependency master already relies
+                # on for borrowed views.
                 for file_id, chunk_index, buffer in self.broadcast(
                     chunks_to_read,
-                    batch_metadata_tensor,
+                    batch_metadata_tensors[slot],
                     received_metadata_tensor,
-                    data_buffer,
+                    data_buffers[slot],
                     received_buffer,
                     chunk_count_in_batch,
                     current_data_size):
                     yield file_id, chunk_index, self.own(buffer) if self.owned else buffer
+
+                if on_cuda:
+                    slot_free[slot] = torch.cuda.current_stream(self.device).record_event()
+                slot = 1 - slot
                
         except RuntimeError as e:
             # Check if the error is a timeout
@@ -603,6 +644,11 @@ class _distributedStreamer:
             self.is_error = True
             logger.exception(f"[RunAI Streamer][Distributed] rank {self.original_group_rank} error: {e}")
             raise e
+        finally:
+            # The last submitted prefill finds no chunks and returns. Waiting for it keeps the thread
+            # from touching chunk_gen after the caller closes this generator.
+            executor.shutdown(wait=True)
+            logger.debug(f"[RunAI Streamer][Distributed] Rank {self.original_group_rank}: waited {prefill_wait:.1f} s for prefill")
 
     @staticmethod
     def own(buffer: torch.Tensor) -> torch.Tensor:

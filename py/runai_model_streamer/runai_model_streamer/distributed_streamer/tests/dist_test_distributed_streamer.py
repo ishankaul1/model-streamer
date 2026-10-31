@@ -282,9 +282,57 @@ class TestDistributedStreamer(unittest.TestCase):
         if self.rank == 0:
             print(f"\n✅ Owned tensors verified on all {self.world_size} ranks.")
 
+    def test_1_cuda_staging_on_the_rank_device(self):
+        # Staging on the GPU, with every round smaller than the stream (BUFFER_MIN_BYTESIZE=0), so the
+        # two staging slots alternate and each is refilled while the caller still holds the other's
+        # tensors. Also checks the device of the background prefill thread: a new thread's current
+        # device is 0, and a rank that prefilled from it created a CUDA context on GPU 0.
+        if self.world_size < 2 or torch.cuda.device_count() < self.world_size:
+            self.skipTest("CUDA staging test requires one GPU per process, and at least 2 processes.")
+
+        from runai_model_streamer.distributed_streamer import distributed_streamer as ds
+
+        device = torch.device("cuda", self.rank)
+        chunk = 260
+        num_chunks = 24
+        file_specs = [{"size": chunk * num_chunks, "chunks": [chunk] * num_chunks}]
+        requests = self._prepare_file_requests(file_specs)
+        original = {}
+        for req in requests:
+            with open(req.path, "rb") as f:
+                original[req.id] = f.read()
+
+        prefill_devices = set()
+        prefill = ds._distributedStreamer.prefill
+
+        def recording_prefill(streamer, *args):
+            prefill_devices.add(torch.cuda.current_device())
+            return prefill(streamer, *args)
+
+        env_vars = {"RUNAI_STREAMER_DIST": "1", "RUNAI_STREAMER_DIST_BUFFER_MIN_BYTESIZE": "0"}
+        # A bare "cuda" means the caller's current device, which a new thread does not share.
+        torch.cuda.set_device(self.rank)
+        for spelling, owned in [(f"cuda:{self.rank}", True), (f"cuda:{self.rank}", False), ("cuda", True)]:
+            with self.subTest(device=spelling, owned=owned):
+                got = {}
+                with patch.dict(os.environ, env_vars), \
+                     patch.object(ds._distributedStreamer, "prefill", recording_prefill):
+                    with DistributedStreamer() as streamer:
+                        streamer.stream_files(requests, None, spelling, True, owned=owned)
+                        for req_id, idx, tensor in streamer.get_chunks():
+                            self.assertEqual(tensor.device, device)
+                            got[(req_id, idx)] = tensor.cpu().numpy().tobytes()
+                self.assertEqual(len(got), num_chunks)
+                for (req_id, idx), data in got.items():
+                    self.assertEqual(data, original[req_id][idx * chunk: (idx + 1) * chunk])
+        self.assertEqual(prefill_devices, {self.rank})
+        if self.rank == 0:
+            print(f"\n✅ CUDA staging verified on all {self.world_size} ranks.")
+
     def test_1_owned_tensors_have_independent_storage(self):
-        # Per TENSOR, not per buffer. Borrowed, every tensor is a view into one of the two staging
-        # buffers, so a whole stream shows at most two storages. Owned, each has its own - otherwise a
+        # Per TENSOR, not per buffer. Borrowed, every tensor is a view into one of the three staging
+        # buffers (two send slots and the receive buffer), so a whole stream shows at most three
+        # storages. Owned, each has its own - otherwise a
         # caller holding one small tensor would pin the buffer it came from.
         if self.world_size < 2:
             self.skipTest("Ownership test requires at least 2 processes.")
@@ -305,7 +353,7 @@ class TestDistributedStreamer(unittest.TestCase):
 
         borrowed = collect(False)
         self.assertLessEqual(
-            len({tensor.untyped_storage().data_ptr() for tensor in borrowed}), 2,
+            len({tensor.untyped_storage().data_ptr() for tensor in borrowed}), 3,
             "borrowed tensors must alias the staging buffers",
         )
 
